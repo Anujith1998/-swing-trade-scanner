@@ -31,7 +31,7 @@ UNIVERSE_100 = [
     "SLB","GE","CAT","DE","HON","ETN","RTX","LMT","NOC","UNH",
     "LLY","JNJ","ABBV","MRK","AMGN","GILD","ISRG","ABT","TMO","DHR",
     "ABNB","UBER","DASH","TSLA","F","GM","RBLX","APP","SHOP","SNOW",
-    "NET","PANW","MELI","BKNG","ADBE","PYPL","SQ","SOFI","CEG","VRT",
+    "NET","PANW","MELI","BKNG","ADBE","PYPL","XYZ","SOFI","CEG","VRT",
 ]
 UNIVERSE_50 = UNIVERSE_100[:50]
 
@@ -160,8 +160,15 @@ def compute_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 def analyze_ticker(ticker: str, frame: pd.DataFrame) -> dict | None:
+    # Validate the raw one-year history BEFORE indicator warm-up rows are dropped.
+    # SMA200, RSI, ATR and rolling-volume calculations naturally remove the
+    # first ~200 rows, leaving only the most recent several dozen valid rows.
+    raw_history = frame.dropna(subset=["Close"])
+    if len(raw_history) < 205:
+        return None
+
     df = compute_indicators(frame)
-    if len(df) < 205:
+    if len(df) < 20:
         return None
 
     # Exclude an in-progress US daily candle before 4:00 p.m. ET.
@@ -174,7 +181,9 @@ def analyze_ticker(ticker: str, frame: pd.DataFrame) -> dict | None:
     if last_date == now_et.date() and now_et.time() < time(16, 0) and len(df) > 205:
         df = df.iloc[:-1]
 
-    if len(df) < 200:
+    # Indicator calculations have already removed the SMA200 warm-up period;
+    # two rows are enough for the latest close and prior-session comparison.
+    if len(df) < 2:
         return None
     row = df.iloc[-1]
     prev = df.iloc[-2]
@@ -354,6 +363,8 @@ if run_scan:
         try:
             frames = download_market_data(tuple(tickers))
             status.write(f"Daily histories returned for {len(frames)} of {len(tickers)} symbols. Calculating technicals…")
+            if not frames:
+                st.error("Yahoo Finance returned no usable price histories. This may be a temporary provider or rate-limit issue. Wait a few minutes, then press Refresh data and scan again.")
             for i, (ticker, frame) in enumerate(frames.items(), start=1):
                 try:
                     item = analyze_ticker(ticker, frame)
@@ -363,6 +374,8 @@ if run_scan:
                     continue
                 progress.progress(i / max(len(frames), 1), text=f"Analysing {i}/{len(frames)} histories…")
             results.sort(key=lambda x: (x["Score"], x["RelVol"]), reverse=True)
+            if frames and not results:
+                st.warning("Price histories downloaded, but none passed the minimum history/indicator checks. Try again later or use a smaller/custom ticker list.")
             st.session_state["scan_results"] = results
             st.session_state["scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             progress.empty()
