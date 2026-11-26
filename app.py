@@ -13,7 +13,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="A-Grade Swing Scanner",
+    page_title="Professional Trading Scanner",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -31,7 +31,7 @@ UNIVERSE_100 = [
     "SLB","GE","CAT","DE","HON","ETN","RTX","LMT","NOC","UNH",
     "LLY","JNJ","ABBV","MRK","AMGN","GILD","ISRG","ABT","TMO","DHR",
     "ABNB","UBER","DASH","TSLA","F","GM","RBLX","APP","SHOP","SNOW",
-    "NET","PANW","MELI","BKNG","ADBE","PYPL","XYZ","SOFI","CEG","VRT",
+    "NET","PANW","MELI","BKNG","ADBE","PYPL","SQ","SOFI","CEG","VRT",
 ]
 UNIVERSE_50 = UNIVERSE_100[:50]
 
@@ -54,17 +54,6 @@ border-radius:16px;padding:1rem 1.1rem;margin-bottom:.7rem;}
 .candidate h3 {margin:0 0 .2rem;color:#f4f8ff;}
 .muted {color:#a9bbd2;font-size:.88rem;}
 </style>
-""", unsafe_allow_html=True)
-
-st.markdown("""
-<div class="hero">
-  <h1>📈 Automatic A-Grade Swing Trade Scanner</h1>
-  <p>US equities · 7-calendar-day holding horizon · Daily technicals · Ranked top 3 candidates</p>
-</div>
-<div class="note"><b>Data note:</b> Uses Yahoo Finance historical daily prices through the third-party
-<code>yfinance</code> package. Data may be delayed, incomplete, rate-limited, or unavailable.
-This scans a selected liquid-stock universe, not every US-listed ticker. Always verify the live quote,
-earnings date, company news, spreads, and market conditions before trading.</div>
 """, unsafe_allow_html=True)
 
 def normalize_tickers(text: str) -> list[str]:
@@ -160,15 +149,8 @@ def compute_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 def analyze_ticker(ticker: str, frame: pd.DataFrame) -> dict | None:
-    # Validate the raw one-year history BEFORE indicator warm-up rows are dropped.
-    # SMA200, RSI, ATR and rolling-volume calculations naturally remove the
-    # first ~200 rows, leaving only the most recent several dozen valid rows.
-    raw_history = frame.dropna(subset=["Close"])
-    if len(raw_history) < 205:
-        return None
-
     df = compute_indicators(frame)
-    if len(df) < 20:
+    if len(df) < 205:
         return None
 
     # Exclude an in-progress US daily candle before 4:00 p.m. ET.
@@ -181,9 +163,7 @@ def analyze_ticker(ticker: str, frame: pd.DataFrame) -> dict | None:
     if last_date == now_et.date() and now_et.time() < time(16, 0) and len(df) > 205:
         df = df.iloc[:-1]
 
-    # Indicator calculations have already removed the SMA200 warm-up period;
-    # two rows are enough for the latest close and prior-session comparison.
-    if len(df) < 2:
+    if len(df) < 200:
         return None
     row = df.iloc[-1]
     prev = df.iloc[-2]
@@ -321,6 +301,156 @@ def analyze_ticker(ticker: str, frame: pd.DataFrame) -> dict | None:
         "History": df.tail(100)[["Close", "SMA20", "SMA50", "SMA200"]].copy(),
     }
 
+@st.cache_data(ttl=180, show_spinner=False)
+def download_intraday_data(tickers: tuple[str, ...]) -> dict[str, pd.DataFrame]:
+    """Download recent regular-session 5-minute OHLCV bars. Yahoo data is not guaranteed live."""
+    downloaded: dict[str, pd.DataFrame] = {}
+    batch_size = 10
+    for start in range(0, len(tickers), batch_size):
+        batch = list(tickers[start:start + batch_size])
+        try:
+            raw = yf.download(
+                tickers=batch, period="5d", interval="5m", auto_adjust=True,
+                group_by="ticker", threads=False, progress=False, timeout=25,
+                prepost=False, multi_level_index=True,
+            )
+        except Exception:
+            continue
+        if raw is None or raw.empty:
+            continue
+        for ticker in batch:
+            frame = None
+            if isinstance(raw.columns, pd.MultiIndex):
+                for level in range(raw.columns.nlevels):
+                    try:
+                        if ticker in raw.columns.get_level_values(level):
+                            candidate = raw.xs(ticker, axis=1, level=level, drop_level=True)
+                            if isinstance(candidate.columns, pd.MultiIndex):
+                                candidate.columns = candidate.columns.get_level_values(-1)
+                            if {"Open", "High", "Low", "Close", "Volume"}.issubset(candidate.columns):
+                                frame = candidate.copy()
+                                break
+                    except (KeyError, ValueError):
+                        pass
+            elif len(batch) == 1 and {"Open", "High", "Low", "Close", "Volume"}.issubset(raw.columns):
+                frame = raw.copy()
+            if frame is not None:
+                frame = frame.loc[:, ["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+                if not frame.empty:
+                    downloaded[ticker] = frame
+        time_module.sleep(0.2)
+    return downloaded
+
+
+def analyze_intraday_ticker(ticker: str, frame: pd.DataFrame, account_size: float, risk_pct: float) -> dict | None:
+    """Score a long-only intraday momentum setup from 5-minute bars."""
+    df = frame.copy()
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+    if len(df) < 30:
+        return None
+
+    idx = pd.DatetimeIndex(df.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    idx_et = idx.tz_convert("America/New_York")
+    df.index = idx_et
+    # Analyse the latest trading session only; avoid mixing VWAP across sessions.
+    latest_day = df.index[-1].date()
+    session = df[df.index.date == latest_day].copy()
+    if len(session) < 12:
+        return None
+
+    typical = (session["High"] + session["Low"] + session["Close"]) / 3
+    session_volume = session["Volume"].clip(lower=0)
+    cumulative_volume = session_volume.cumsum().replace(0, np.nan)
+    session["VWAP"] = (typical * session_volume).cumsum() / cumulative_volume
+    session["EMA9"] = session["Close"].ewm(span=9, adjust=False).mean()
+    session["EMA20"] = session["Close"].ewm(span=20, adjust=False).mean()
+    delta = session["Close"].diff()
+    avg_gain = delta.clip(lower=0).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_loss = (-delta.clip(upper=0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    session["RSI14"] = 100 - (100 / (1 + rs))
+    session["RSI14"] = session["RSI14"].fillna(50)
+    prev_close = session["Close"].shift(1)
+    tr = pd.concat([(session["High"] - session["Low"]),
+                    (session["High"] - prev_close).abs(),
+                    (session["Low"] - prev_close).abs()], axis=1).max(axis=1)
+    session["ATR14"] = tr.ewm(alpha=1/14, min_periods=5, adjust=False).mean()
+    session["VOL20"] = session["Volume"].rolling(20, min_periods=5).mean()
+    row = session.iloc[-1]
+    price = float(row["Close"])
+    vwap = float(row["VWAP"]) if pd.notna(row["VWAP"]) else price
+    ema9, ema20 = float(row["EMA9"]), float(row["EMA20"])
+    rsi = float(row["RSI14"])
+    atr = float(row["ATR14"]) if pd.notna(row["ATR14"]) else 0.0
+    avg_vol = float(row["VOL20"]) if pd.notna(row["VOL20"]) and row["VOL20"] > 0 else 0.0
+    rvol = float(row["Volume"] / avg_vol) if avg_vol else 0.0
+    prior_high = float(session["High"].iloc[-7:-1].max()) if len(session) >= 7 else float(session["High"].iloc[:-1].max())
+    recent_low = float(session["Low"].iloc[-6:].min())
+    # Stop is placed below both the recent micro swing low and an ATR buffer.
+    stop = min(recent_low, price - 1.2 * atr) if atr > 0 else recent_low
+    risk_per_share = price - stop
+    if not math.isfinite(risk_per_share) or risk_per_share <= 0 or price <= 0:
+        return None
+    target1, target2 = price + risk_per_share, price + 2 * risk_per_share
+    risk_budget = account_size * (risk_pct / 100.0)
+    shares_by_risk = int(risk_budget // risk_per_share) if risk_per_share > 0 else 0
+    shares_by_cash = int(account_size // price) if price > 0 else 0
+    shares = max(0, min(shares_by_risk, shares_by_cash))
+
+    # Breakout uses the prior six 5-minute bars (approximately 30 minutes).
+    breakout = price > prior_high
+    trend_ok = price > vwap and ema9 > ema20
+    score = 0
+    reasons = []
+    if trend_ok:
+        score += 25; reasons.append("Price above session VWAP; EMA9 above EMA20")
+    else:
+        reasons.append("VWAP/EMA trend not fully aligned")
+    if 50 <= rsi <= 70:
+        score += 15; reasons.append("RSI in intraday momentum zone")
+    elif 45 <= rsi < 50 or 70 < rsi <= 75:
+        score += 8; reasons.append("RSI acceptable but not ideal")
+    else:
+        reasons.append("RSI weak or potentially overextended")
+    if rvol >= 1.5:
+        score += 20; reasons.append("Volume at least 1.5x recent bar average")
+    elif rvol >= 1.2:
+        score += 14; reasons.append("Volume at least 1.2x recent bar average")
+    elif rvol >= 1.0:
+        score += 7; reasons.append("Volume near recent bar average")
+    else:
+        reasons.append("Volume below recent bar average")
+    if breakout:
+        score += 20; reasons.append("Breakout above prior six-bar high")
+    else:
+        reasons.append("No six-bar breakout")
+    if risk_per_share / price <= 0.025:
+        score += 15; reasons.append("Stop distance within 2.5%")
+    elif risk_per_share / price <= 0.04:
+        score += 8; reasons.append("Stop distance moderately wide")
+    else:
+        reasons.append("Stop distance too wide for preferred intraday risk")
+    if float(row["Volume"]) * price >= 100_000:
+        score += 5; reasons.append("Current bar has reasonable dollar turnover")
+
+    hard_gate = trend_ok and 48 <= rsi <= 72 and rvol >= 1.0 and breakout and risk_per_share / price <= 0.04
+    grade = "A" if score >= 80 and hard_gate else ("B" if score >= 65 else ("C" if score >= 45 else "D"))
+    setup = "VWAP momentum breakout" if breakout and trend_ok else ("VWAP trend; waiting for breakout" if trend_ok else "No confirmed intraday setup")
+    return {
+        "Ticker": ticker, "Score": int(score), "Grade": grade, "Setup": setup,
+        "Price": price, "RSI": rsi, "RelVol": rvol, "VWAP": vwap,
+        "EMA9": ema9, "EMA20": ema20, "EntryGuide": price, "StopGuide": stop,
+        "Target1": target1, "Target2": target2, "Risk%": risk_per_share / price * 100,
+        "Shares": shares, "RiskBudget": risk_budget, "DateTime": session.index[-1].strftime("%Y-%m-%d %H:%M ET"),
+        "Reasons": reasons, "History": session[["Close", "VWAP", "EMA9", "EMA20"]].copy(),
+    }
+
+
+# Shared controls: blank price bounds mean no price restriction.
 with st.sidebar:
     st.header("Scanner settings")
     universe_choice = st.radio("Stock universe", ["Top 50 liquid stocks", "Top 100 liquid stocks", "Custom tickers"], index=1)
@@ -329,130 +459,218 @@ with st.sidebar:
     elif universe_choice == "Top 100 liquid stocks":
         tickers = UNIVERSE_100
     else:
-        custom = st.text_area("Enter tickers separated by commas", "NVDA, AMD, ANET, AAPL, MSFT")
+        custom = st.text_area("Enter tickers separated by commas", "NVDA, AMD, SOFI, PLTR, AAPL")
         tickers = normalize_tickers(custom)
     tickers = list(dict.fromkeys(tickers))
     st.caption(f"{len(tickers)} unique tickers selected")
     st.divider()
-    st.markdown("**A-grade rules**")
-    st.caption("Score ≥82/100 plus trend, RSI, relative-volume, liquidity, risk, and confirmed setup gates.")
-    st.caption("Minimum planned reward/risk: 2:1, based on the technical stop guide.")
+    st.subheader("Optional price filter (USD)")
+    min_price = st.number_input("Minimum stock price", min_value=0.0, value=0.0, step=0.5, format="%.2f", help="Leave at 0 to set no minimum.")
+    max_price = st.number_input("Maximum stock price", min_value=0.0, value=0.0, step=0.5, format="%.2f", help="Leave at 0 to set no maximum.")
+    if min_price > 0 and max_price > 0 and min_price > max_price:
+        st.error("Minimum price must be less than or equal to maximum price.")
     st.divider()
-    st.caption("Data source: Yahoo Finance via yfinance. Not an official real-time feed.")
+    st.subheader("Position sizing")
+    account_size = st.number_input("Account size (USD)", min_value=100.0, value=1400.0, step=100.0)
+    risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
+    st.caption("Share sizing is a guide based on account risk and available cash; it does not include fees, slippage or gaps.")
+    st.divider()
+    st.caption("Data: Yahoo Finance via yfinance. Not an official real-time feed.")
 
-col1, col2, col3 = st.columns([1.25, 1, 1])
-with col1:
-    run_scan = st.button("🔎 Scan for top 3", type="primary", use_container_width=True)
-with col2:
-    clear_cache = st.button("↻ Refresh data", use_container_width=True)
-with col3:
-    st.metric("Holding period", "Up to 7 days")
 
-if clear_cache:
-    download_market_data.clear()
-    st.session_state.pop("scan_results", None)
-    st.rerun()
+def apply_price_filter(items: list[dict]) -> list[dict]:
+    if min_price > 0 and max_price > 0 and min_price > max_price:
+        return []
+    return [x for x in items if (min_price <= 0 or x["Price"] >= min_price) and (max_price <= 0 or x["Price"] <= max_price)]
 
-if run_scan:
-    if not tickers:
-        st.error("Enter at least one valid ticker.")
+
+st.markdown("""
+<div class="hero">
+  <h1>📈 Professional Trading Scanner</h1>
+  <p>US equities · Swing + Intraday · Configurable price range · Risk-based trade planning</p>
+</div>
+<div class="note"><b>Data note:</b> Daily and 5-minute historical data are provided by Yahoo Finance through yfinance.
+Intraday data may be delayed, incomplete, or rate-limited. This scans only the selected ticker universe,
+not every US-listed stock. Confirm live quotes, news, earnings, spreads and market conditions before trading.</div>
+""", unsafe_allow_html=True)
+
+swing_tab, intraday_tab = st.tabs(["📈 Swing Trading", "⚡ Intraday Trading"])
+
+with swing_tab:
+    st.subheader("Swing trade scanner")
+    st.caption("Daily technical analysis · Existing A-grade rules retained · Up to 7-calendar-day holding horizon")
+    c1, c2, c3 = st.columns([1.25, 1, 1])
+    with c1:
+        run_swing = st.button("🔎 Scan swing opportunities", type="primary", use_container_width=True, key="run_swing")
+    with c2:
+        refresh_swing = st.button("↻ Refresh swing data", use_container_width=True, key="refresh_swing")
+    with c3:
+        st.metric("Holding period", "Up to 7 days")
+
+    if refresh_swing:
+        download_market_data.clear()
+        st.session_state.pop("swing_results", None)
+        st.rerun()
+    if run_swing:
+        if not tickers:
+            st.error("Enter at least one valid ticker.")
+        elif min_price > 0 and max_price > 0 and min_price > max_price:
+            st.error("Minimum price must not exceed maximum price.")
+        else:
+            progress = st.progress(0, text="Downloading daily market data…")
+            status = st.empty()
+            try:
+                frames = download_market_data(tuple(tickers))
+                raw_results = []
+                status.write(f"Daily histories returned for {len(frames)} of {len(tickers)} symbols. Calculating technicals…")
+                for i, (ticker, frame) in enumerate(frames.items(), start=1):
+                    try:
+                        item = analyze_ticker(ticker, frame)
+                        if item:
+                            raw_results.append(item)
+                    except Exception:
+                        continue
+                    progress.progress(i / max(len(frames), 1), text=f"Analysing {i}/{len(frames)} histories…")
+                filtered = apply_price_filter(raw_results)
+                filtered.sort(key=lambda x: (x["Score"], x["RelVol"]), reverse=True)
+                st.session_state["swing_results"] = filtered
+                st.session_state["swing_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["swing_symbols_analysed"] = len(raw_results)
+                progress.empty(); status.empty()
+            except Exception as exc:
+                progress.empty(); status.empty()
+                st.error(f"Market-data request failed: {exc}")
+                st.info("Yahoo may temporarily rate-limit requests. Wait, refresh data, then scan again.")
+
+    results = st.session_state.get("swing_results", [])
+    if results:
+        a_candidates = [x for x in results if x["Grade"] == "A"]
+        b_candidates = [x for x in results if x["Grade"] == "B"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Symbols analysed", st.session_state.get("swing_symbols_analysed", len(results)))
+        m2.metric("Within price filter", len(results))
+        m3.metric("A-grade setups", len(a_candidates))
+        m4.metric("Scan run", st.session_state.get("swing_scan_time", "Unknown"))
+        if a_candidates:
+            st.success(f"{len(a_candidates)} A-grade setup(s) passed all technical gates.")
+        else:
+            st.warning("No A-grade setup passed all rules. Do not force a trade; lower grades are watchlist candidates, not buy signals.")
+        st.subheader("Top 3 swing candidates")
+        cards = st.columns(3)
+        for col, item, rank in zip(cards, results[:3], range(1, 4)):
+            with col:
+                st.markdown(f"<div class='candidate'><h3>#{rank} {item['Ticker']} · {item['Grade']} · {item['Score']}/100</h3><div class='muted'>{item['Setup']} · {item['Date']}</div></div>", unsafe_allow_html=True)
+                st.metric("Last close", f"${item['Price']:.2f}")
+                st.write(f"**RSI:** {item['RSI']:.1f} · **Rel. volume:** {item['RelVol']:.2f}×")
+                st.write(f"**Stop:** ${item['StopGuide']:.2f} · **2R target:** ${item['Target2R']:.2f}")
+                risk_ps = max(item["Price"] - item["StopGuide"], 0)
+                shares = min(int((account_size * risk_pct / 100) // risk_ps), int(account_size // item["Price"])) if risk_ps > 0 else 0
+                st.write(f"**Suggested shares:** {shares} · **Risk:** {item['Risk%']:.2f}%")
+                with st.expander("Why this ranked here"):
+                    for reason in item["Reasons"]: st.write("• " + reason)
+        st.subheader("Full swing scan")
+        view = pd.DataFrame([{k: v for k, v in x.items() if k not in ["Reasons", "History"]} for x in results])
+        cols = ["Ticker","Score","Grade","Setup","Price","RSI","RelVol","SMA20","SMA50","SMA200","StopGuide","Target2R","Risk%","Date"]
+        st.dataframe(view[cols].style.format({"Price":"${:.2f}","SMA20":"${:.2f}","SMA50":"${:.2f}","SMA200":"${:.2f}","StopGuide":"${:.2f}","Target2R":"${:.2f}","RSI":"{:.1f}","RelVol":"{:.2f}×","Risk%":"{:.2f}%"}), use_container_width=True, hide_index=True)
+        chosen = st.selectbox("Chart a swing ticker", [x["Ticker"] for x in results[:min(20, len(results))]], key="swing_chart")
+        selected = next(x for x in results if x["Ticker"] == chosen)
+        st.line_chart(selected["History"], height=300)
+        st.download_button("⬇️ Download swing results CSV", view[cols].to_csv(index=False).encode("utf-8"), file_name="swing_scan_results.csv", mime="text/csv")
+    elif "swing_results" in st.session_state:
+        st.warning("No stocks matched the current price filter and swing rules.")
     else:
-        results = []
-        progress = st.progress(0, text="Downloading daily market data…")
-        status = st.empty()
-        try:
-            frames = download_market_data(tuple(tickers))
-            status.write(f"Daily histories returned for {len(frames)} of {len(tickers)} symbols. Calculating technicals…")
-            if not frames:
-                st.error("Yahoo Finance returned no usable price histories. This may be a temporary provider or rate-limit issue. Wait a few minutes, then press Refresh data and scan again.")
-            for i, (ticker, frame) in enumerate(frames.items(), start=1):
-                try:
-                    item = analyze_ticker(ticker, frame)
-                    if item:
-                        results.append(item)
-                except Exception:
-                    continue
-                progress.progress(i / max(len(frames), 1), text=f"Analysing {i}/{len(frames)} histories…")
-            results.sort(key=lambda x: (x["Score"], x["RelVol"]), reverse=True)
-            if frames and not results:
-                st.warning("Price histories downloaded, but none passed the minimum history/indicator checks. Try again later or use a smaller/custom ticker list.")
-            st.session_state["scan_results"] = results
-            st.session_state["scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            progress.empty()
-            status.empty()
-        except Exception as exc:
-            progress.empty()
-            status.empty()
-            st.error(f"Market-data request failed: {exc}")
-            st.info("Yahoo may temporarily rate-limit requests. Wait a little, then press Refresh data and scan again.")
+        st.info("Press Scan swing opportunities. Leave both price fields at 0 to scan all available prices.")
+        st.markdown("**Existing A-grade rules:** price above SMA50/SMA200, SMA20 above SMA50, RSI 48–70, relative volume ≥1.15×, pullback or breakout trigger, average dollar turnover ≥$20M, and stop distance ≤5.5%.")
 
-results = st.session_state.get("scan_results", [])
-if results:
-    scan_time = st.session_state.get("scan_time", "Unknown")
-    a_candidates = [x for x in results if x["Grade"] == "A"]
-    b_candidates = [x for x in results if x["Grade"] == "B"]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Symbols analysed", len(results))
-    m2.metric("A-grade setups", len(a_candidates))
-    m3.metric("B-grade watchlist", len(b_candidates))
-    m4.metric("Scan run", scan_time)
-    st.subheader("🏆 Top 3 technical candidates")
-    if a_candidates:
-        st.success(f"{len(a_candidates)} A-grade setup(s) passed all technical gates.")
+with intraday_tab:
+    st.subheader("Intraday momentum scanner")
+    st.caption("5-minute bars · Session VWAP · EMA9/EMA20 · RSI · Relative bar volume · 30-minute breakout check")
+    c1, c2, c3 = st.columns([1.25, 1, 1])
+    with c1:
+        run_intraday = st.button("⚡ Scan intraday opportunities", type="primary", use_container_width=True, key="run_intraday")
+    with c2:
+        refresh_intraday = st.button("↻ Refresh intraday data", use_container_width=True, key="refresh_intraday")
+    with c3:
+        st.metric("Chart interval", "5 minutes")
+    if refresh_intraday:
+        download_intraday_data.clear()
+        st.session_state.pop("intraday_results", None)
+        st.rerun()
+    if run_intraday:
+        if not tickers:
+            st.error("Enter at least one valid ticker.")
+        elif min_price > 0 and max_price > 0 and min_price > max_price:
+            st.error("Minimum price must not exceed maximum price.")
+        else:
+            progress = st.progress(0, text="Downloading recent 5-minute bars…")
+            status = st.empty()
+            try:
+                frames = download_intraday_data(tuple(tickers))
+                raw_results = []
+                status.write(f"Intraday histories returned for {len(frames)} of {len(tickers)} symbols. Analysing setups…")
+                for i, (ticker, frame) in enumerate(frames.items(), start=1):
+                    try:
+                        item = analyze_intraday_ticker(ticker, frame, account_size, risk_pct)
+                        if item: raw_results.append(item)
+                    except Exception:
+                        continue
+                    progress.progress(i / max(len(frames), 1), text=f"Analysing {i}/{len(frames)} symbols…")
+                filtered = apply_price_filter(raw_results)
+                filtered.sort(key=lambda x: (x["Score"], x["RelVol"]), reverse=True)
+                st.session_state["intraday_results"] = filtered
+                st.session_state["intraday_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["intraday_symbols_analysed"] = len(raw_results)
+                progress.empty(); status.empty()
+            except Exception as exc:
+                progress.empty(); status.empty()
+                st.error(f"Intraday data request failed: {exc}")
+                st.info("Yahoo may not return intraday bars for every symbol. Try fewer tickers or refresh later.")
+    intraday_results = st.session_state.get("intraday_results", [])
+    if intraday_results:
+        a_count = sum(x["Grade"] == "A" for x in intraday_results)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Symbols analysed", st.session_state.get("intraday_symbols_analysed", len(intraday_results)))
+        m2.metric("Within price filter", len(intraday_results))
+        m3.metric("A-grade setups", a_count)
+        m4.metric("Scan run", st.session_state.get("intraday_scan_time", "Unknown"))
+        if a_count:
+            st.success(f"{a_count} A-grade intraday setup(s) passed the technical gates.")
+        else:
+            st.warning("No A-grade intraday setup found. Wait for a clearer setup rather than forcing a trade.")
+        st.subheader("Top 5 intraday candidates")
+        for rank, item in enumerate(intraday_results[:5], start=1):
+            with st.container(border=True):
+                left, mid, right = st.columns([1.3, 1.2, 1.5])
+                with left:
+                    st.markdown(f"### #{rank} {item['Ticker']} · {item['Grade']} ({item['Score']}/100)")
+                    st.write(item["Setup"])
+                    st.metric("Last 5-minute close", f"${item['Price']:.2f}")
+                with mid:
+                    st.write(f"**Entry guide:** ${item['EntryGuide']:.2f}")
+                    st.write(f"**Stop-loss guide:** ${item['StopGuide']:.2f}")
+                    st.write(f"**Target 1 (1R):** ${item['Target1']:.2f}")
+                    st.write(f"**Target 2 (2R):** ${item['Target2']:.2f}")
+                with right:
+                    st.write(f"**RSI:** {item['RSI']:.1f} · **Rel. volume:** {item['RelVol']:.2f}×")
+                    st.write(f"**VWAP:** ${item['VWAP']:.2f}")
+                    st.write(f"**Risk:** {item['Risk%']:.2f}% · **Shares:** {item['Shares']}")
+                    st.write(f"**Planned max risk:** ${item['Shares'] * (item['Price'] - item['StopGuide']):.2f}")
+                with st.expander("Scoring details"):
+                    for reason in item["Reasons"]: st.write("• " + reason)
+                    st.caption(f"Latest bar: {item['DateTime']}. Entry is a calculation guide, not an order or confirmation of a fill.")
+        intraday_view = pd.DataFrame([{k: v for k, v in x.items() if k not in ["Reasons", "History"]} for x in intraday_results])
+        st.subheader("Full intraday scan")
+        display = ["Ticker","Score","Grade","Setup","Price","RSI","RelVol","VWAP","EMA9","EMA20","StopGuide","Target1","Target2","Risk%","Shares","DateTime"]
+        st.dataframe(intraday_view[display].style.format({c:"${:.2f}" for c in ["Price","VWAP","EMA9","EMA20","StopGuide","Target1","Target2"]} | {"RSI":"{:.1f}","RelVol":"{:.2f}×","Risk%":"{:.2f}%"}), use_container_width=True, hide_index=True)
+        chart_ticker = st.selectbox("Chart an intraday ticker", [x["Ticker"] for x in intraday_results[:min(20, len(intraday_results))]], key="intraday_chart")
+        chart_item = next(x for x in intraday_results if x["Ticker"] == chart_ticker)
+        st.line_chart(chart_item["History"], height=300)
+        st.download_button("⬇️ Download intraday results CSV", intraday_view[display].to_csv(index=False).encode("utf-8"), file_name="intraday_scan_results.csv", mime="text/csv")
+    elif "intraday_results" in st.session_state:
+        st.warning("No stocks matched the current price filter and intraday rules.")
     else:
-        st.warning("No A-grade setup passed all rules. Do not force a trade. The cards below are ranked watchlist candidates, not buy signals.")
-    top3 = results[:3]
-    cards = st.columns(3)
-    for col, item, rank in zip(cards, top3, range(1, 4)):
-        with col:
-            st.markdown(f"""
-            <div class="candidate">
-              <h3>#{rank} {item['Ticker']} &nbsp; <span class="{'good' if item['Grade']=='A' else 'bad' if item['Grade'] in ['C','D'] else ''}">{item['Grade']} · {item['Score']}/100</span></h3>
-              <div class="muted">{item['Setup']} · Daily data through {item['Date']}</div>
-            </div>
-            """, unsafe_allow_html=True)
-            st.metric("Last close", f"${item['Price']:.2f}")
-            st.write(f"**RSI:** {item['RSI']:.1f} · **Rel. volume:** {item['RelVol']:.2f}×")
-            st.write(f"**Stop guide:** ${item['StopGuide']:.2f}")
-            st.write(f"**2R target guide:** ${item['Target2R']:.2f}")
-            st.write(f"**Risk to stop:** {item['Risk%']:.2f}%")
-            with st.expander("Why this ranked here"):
-                for reason in item["Reasons"]:
-                    st.write("• " + reason)
-
-    st.subheader("Full ranked scan")
-    view = pd.DataFrame([{k: v for k, v in x.items() if k not in ["Reasons", "History"]} for x in results])
-    display_cols = ["Ticker","Score","Grade","Setup","Price","RSI","RelVol","SMA20","SMA50","SMA200","StopGuide","Target2R","Risk%","Date"]
-    st.dataframe(
-        view[display_cols].style.format({
-            "Price":"${:.2f}", "SMA20":"${:.2f}", "SMA50":"${:.2f}", "SMA200":"${:.2f}",
-            "StopGuide":"${:.2f}", "Target2R":"${:.2f}", "RSI":"{:.1f}", "RelVol":"{:.2f}×", "Risk%":"{:.2f}%"
-        }),
-        use_container_width=True, hide_index=True
-    )
-    chosen = st.selectbox("Chart a ticker", [x["Ticker"] for x in results[:min(20, len(results))]])
-    selected = next(x for x in results if x["Ticker"] == chosen)
-    st.subheader(f"{chosen} · Daily trend")
-    st.line_chart(selected["History"], height=300)
-    csv = view[display_cols].to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download scan results CSV", csv, file_name="swing_scan_results.csv", mime="text/csv")
-else:
-    st.info("Press **Scan for top 3** to fetch daily prices, calculate indicators, and rank candidates.")
-    st.markdown("""
-    **What qualifies as A-grade?**
-    - Price above SMA50 and SMA200, with SMA20 above SMA50.
-    - RSI in a controlled momentum zone (48–70).
-    - Relative volume at least 1.15× its 20-session average.
-    - A recognized 20-day pullback or 20-session breakout.
-    - Average daily dollar turnover of at least $20 million.
-    - Stop-distance estimate no wider than 5.5%.
-    - Composite technical score of at least 82/100.
-    """)
+        st.info("Press Scan intraday opportunities. Intraday analysis uses 5-minute historical bars and may be delayed or incomplete.")
+        st.markdown("**Intraday A-grade gates:** price above VWAP, EMA9 above EMA20, RSI 48–72, relative bar volume ≥1.0×, breakout above the prior six 5-minute bars, and stop distance ≤4%.")
 
 st.divider()
-st.caption(
-    "Educational screening tool only. It does not verify earnings dates, breaking news, SEC filings, "
-    "borrow availability, or live bid/ask spreads. Yahoo Finance data access via yfinance is unofficial "
-    "and can be delayed, incomplete, or rate-limited. A technical A grade is not a probability of profit "
-    "or a recommendation to buy. Confirm price action and events before any trade."
-)
+st.caption("Educational screening tool only. Scores are rule-based rankings, not win probabilities. Yahoo Finance/yfinance is unofficial and may be delayed, incomplete or rate-limited. This scanner does not verify breaking news, SEC filings, earnings dates, spreads, halts, borrow availability or order-book liquidity. Stops do not guarantee execution prices; gaps and slippage can exceed planned risk. Confirm all trades with a live broker feed before acting.")
